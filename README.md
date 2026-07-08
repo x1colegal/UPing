@@ -70,7 +70,7 @@ python3 client.py -4 --peer-ip x1co.com.br
 Infinite ping:
 
 ```bash
-python3 client.py --peer-ip x1co.com.br -c 0
+python3 client.py --peer-ip x1co.com.br
 ```
 
 Custom interval and timeout:

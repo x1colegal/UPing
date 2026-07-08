@@ -261,7 +261,7 @@ def main() -> None:
     ap.add_argument("--peer-port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--bind-ip", default="0.0.0.0")
     ap.add_argument("--bind-port", type=int, default=0)
-    ap.add_argument("--count", "-c", type=int, default=4, help="Number of pings, 0 = infinite")
+    ap.add_argument("--count", "-c", type=int, default=0, help="Number of pings, 0 = infinite")
     ap.add_argument("--interval", "-i", type=float, default=1.0, help="Seconds between pings")
     ap.add_argument("--timeout", "-W", type=float, default=3.0, help="Per-ping timeout in seconds")
     ap.add_argument("--connect-timeout", type=float, default=6.0, help="USTPS handshake timeout per family")

@@ -264,6 +264,7 @@ def maybe_install_systemd(args: argparse.Namespace) -> None:
         print(f"[UPING-SERVER] systemd unit updated at {SYSTEMD_UNIT_PATH}")
     os.system("systemctl daemon-reload >/dev/null 2>&1")
     os.system("systemctl enable uping-server.service >/dev/null 2>&1")
+    os.system("systemctl restart uping-server.service >/dev/null 2>&1")
     if current is None:
         print(f"[UPING-SERVER] systemd unit installed automatically at {SYSTEMD_UNIT_PATH}")
 
