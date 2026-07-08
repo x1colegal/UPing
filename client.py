@@ -257,7 +257,7 @@ def close_transport(raw_sock, usock_obj, current_peer, current_sender) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="UPing: USTPS ping")
-    ap.add_argument("peer_ip", help="Server hostname or IP")
+    ap.add_argument("--peer-ip", required=True, help="Server hostname or IP")
     ap.add_argument("--peer-port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--bind-ip", default="0.0.0.0")
     ap.add_argument("--bind-port", type=int, default=0)

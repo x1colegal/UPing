@@ -44,31 +44,31 @@ python3 server.py --bind-ip 0.0.0.0 --bind-port 40002
 Default:
 
 ```bash
-python3 client.py x1co.com.br
+python3 client.py --peer-ip x1co.com.br
 ```
 
 Force IPv6:
 
 ```bash
-python3 client.py -6 x1co.com.br
+python3 client.py -6 --peer-ip x1co.com.br
 ```
 
 Force IPv4:
 
 ```bash
-python3 client.py -4 x1co.com.br
+python3 client.py -4 --peer-ip x1co.com.br
 ```
 
 Infinite ping:
 
 ```bash
-python3 client.py x1co.com.br -c 0
+python3 client.py --peer-ip x1co.com.br -c 0
 ```
 
 Custom interval and timeout:
 
 ```bash
-python3 client.py x1co.com.br -i 1.0 -W 3.0
+python3 client.py --peer-ip x1co.com.br -i 1.0 -W 3.0
 ```
 
 ## Notes
