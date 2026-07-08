@@ -47,6 +47,12 @@ Custom bind:
 python3 server.py --bind-ip 0.0.0.0 --bind-port 40002
 ```
 
+Simulated loss:
+
+```bash
+python3 server.py --start --loss 30
+```
+
 ## Client
 
 Default:
@@ -86,3 +92,4 @@ python3 client.py --peer-ip x1co.com.br -i 1.0 -W 3.0
 - default client/server cipher is `chacha20`
 - the tool measures RTT of the whole `USTPS` path, not bare UDP alone
 - the client output is intentionally ping-like, but it reports `USTPS` session information instead of ICMP fields
+- `--loss` simulates outbound packet loss on the server side for testing

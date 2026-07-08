@@ -289,6 +289,7 @@ def main() -> None:
     ap.add_argument("--host-key-file", default=os.path.expanduser("~/.uping_host_key"))
     ap.add_argument("--window", type=int, default=256)
     ap.add_argument("--rto", type=float, default=0.20)
+    ap.add_argument("--loss", type=int, default=0, help="Simulated outbound packet loss percent (0-100)")
     args = ap.parse_args()
 
     maybe_configure_and_exit(args)
@@ -368,6 +369,7 @@ def main() -> None:
             peer=addr,
             window=args.window,
             rto=args.rto,
+            loss_percent=args.loss,
             congestion_control=(challenge.congestion_control == "on"),
         )
         sender.start()
