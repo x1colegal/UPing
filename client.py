@@ -300,6 +300,9 @@ def main() -> None:
     rtts = []
     seq = 0
     payload = b"Q" * max(0, args.size)
+    remote_family = "IPv6" if ":" in current_peer[0] else "IPv4"
+
+    print(f"UPING {args.peer_ip} ({current_peer[0]}) over USTPS: {len(payload)} data bytes, port {args.peer_port}, {remote_family}")
 
     try:
         while args.count == 0 or sent < args.count:
@@ -335,12 +338,14 @@ def main() -> None:
                 rtt_ms = (time.monotonic_ns() - reply["sent_ns"]) / 1_000_000.0
                 received += 1
                 rtts.append(rtt_ms)
-                fam = "IPv6" if ":" in current_peer[0] else "IPv4"
-                print(f"{len(reply['payload'])} bytes from {current_peer[0]}:{current_peer[1]} seq={seq} time={rtt_ms:.2f} ms via {fam}")
+                print(
+                    f"{len(reply['payload'])} bytes from {current_peer[0]}:{current_peer[1]}: "
+                    f"up_seq={seq} time={rtt_ms:.2f} ms family={remote_family}"
+                )
                 got_reply = True
                 break
             if not got_reply:
-                print(f"timeout for seq={seq}")
+                print(f"Request timeout for up_seq={seq}")
             if args.count == 0 or sent < args.count:
                 time.sleep(max(0.0, args.interval))
     except KeyboardInterrupt:

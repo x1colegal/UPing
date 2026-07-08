@@ -6,6 +6,7 @@ import secrets
 import socket
 import threading
 import time
+import shlex
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives import serialization
@@ -25,6 +26,7 @@ RESPONSE_PREFIX = b"USTPS-CHALLENGE-REPLY1\0"
 SESSION_PREFIX = b"USTPS-SESSION1\0"
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 DEFAULT_PORT = 40002
+SYSTEMD_UNIT_PATH = "/etc/systemd/system/uping-server.service"
 
 
 @dataclass
@@ -203,8 +205,81 @@ def create_server_udp_socket(bind_ip: str, bind_port: int) -> socket.socket:
     raise OSError(errno.EADDRNOTAVAIL, "unable to bind UDP socket")
 
 
+def systemd_available() -> bool:
+    return os.path.isdir("/run/systemd/system") and os.path.isdir("/etc/systemd/system")
+
+
+def build_systemd_unit(args: argparse.Namespace) -> str:
+    cmd = [
+        "python3",
+        os.path.abspath(__file__),
+        "--start",
+    ]
+    if args.bind_ip != "0.0.0.0":
+        cmd.extend(["--bind-ip", args.bind_ip])
+    if args.bind_port != DEFAULT_PORT:
+        cmd.extend(["--bind-port", str(args.bind_port)])
+    if args.cipher != "auto":
+        cmd.extend(["--cipher", args.cipher])
+    if args.congestion_control != "auto":
+        cmd.extend(["--congestion-control", args.congestion_control])
+    if args.cleartext != "auto":
+        cmd.extend(["--cleartext", args.cleartext])
+    if args.host_key_file != os.path.expanduser("~/.uping_host_key"):
+        cmd.extend(["--host-key-file", args.host_key_file])
+    if args.window != 256:
+        cmd.extend(["--window", str(args.window)])
+    if args.rto != 0.20:
+        cmd.extend(["--rto", str(args.rto)])
+    exec_start = " ".join(shlex.quote(part) for part in cmd)
+    return (
+        "[Unit]\n"
+        "Description=UPing server (USTPS-Ping)\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"WorkingDirectory={shlex.quote(os.path.dirname(os.path.abspath(__file__)))}\n"
+        f"ExecStart={exec_start}\n"
+        "Restart=always\n"
+        "RestartSec=2\n\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def maybe_install_systemd(args: argparse.Namespace) -> None:
+    if not systemd_available() or os.geteuid() != 0:
+        return
+    unit_text = build_systemd_unit(args)
+    current = None
+    try:
+        with open(SYSTEMD_UNIT_PATH, "r", encoding="utf-8") as f:
+            current = f.read()
+    except FileNotFoundError:
+        pass
+    if current != unit_text:
+        with open(SYSTEMD_UNIT_PATH, "w", encoding="utf-8") as f:
+            f.write(unit_text)
+        print(f"[UPING-SERVER] systemd unit updated at {SYSTEMD_UNIT_PATH}")
+    os.system("systemctl daemon-reload >/dev/null 2>&1")
+    os.system("systemctl enable uping-server.service >/dev/null 2>&1")
+    if current is None:
+        print(f"[UPING-SERVER] systemd unit installed automatically at {SYSTEMD_UNIT_PATH}")
+
+
+def maybe_configure_and_exit(args: argparse.Namespace) -> None:
+    if args.start:
+        return
+    maybe_install_systemd(args)
+    if systemd_available() and os.geteuid() == 0:
+        print("[UPING-SERVER] configuration completed")
+        raise SystemExit(0)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="UPing server: USTPS ping responder")
+    ap.add_argument("--start", action="store_true")
     ap.add_argument("--bind-ip", default="0.0.0.0")
     ap.add_argument("--bind-port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--cipher", default="auto", help="auto | chacha20 | aes-256-gcm | aes-128-gcm")
@@ -214,6 +289,8 @@ def main() -> None:
     ap.add_argument("--window", type=int, default=256)
     ap.add_argument("--rto", type=float, default=0.20)
     args = ap.parse_args()
+
+    maybe_configure_and_exit(args)
 
     raw_sock = create_server_udp_socket(args.bind_ip, args.bind_port)
     selected_cipher = None if args.cipher == "auto" else normalize_cipher_name(args.cipher)

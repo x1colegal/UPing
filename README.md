@@ -33,6 +33,14 @@ It is a ping-like tool built on top of **USTP-Secure**.
 python3 server.py
 ```
 
+If `systemd` is available and you run it as `root`, running without `--start` installs/updates the unit and exits.
+
+Foreground run:
+
+```bash
+python3 server.py --start
+```
+
 Custom bind:
 
 ```bash
@@ -77,3 +85,4 @@ python3 client.py --peer-ip x1co.com.br -i 1.0 -W 3.0
 - TOFU is enabled on the client
 - default client/server cipher is `chacha20`
 - the tool measures RTT of the whole `USTPS` path, not bare UDP alone
+- the client output is intentionally ping-like, but it reports `USTPS` session information instead of ICMP fields
