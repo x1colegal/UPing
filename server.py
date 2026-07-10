@@ -24,6 +24,7 @@ HELLO_PREFIX = b"USTPS-KEX1\0"
 CHALLENGE_PREFIX = b"USTPS-CHALLENGE1\0"
 RESPONSE_PREFIX = b"USTPS-CHALLENGE-REPLY1\0"
 SESSION_PREFIX = b"USTPS-SESSION1\0"
+DATA_PORT_PREFIX = b"USTPS-DATA1\0"
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 DEFAULT_PORT = 40002
 SYSTEMD_UNIT_PATH = "/etc/systemd/system/uping-server.service"
@@ -36,6 +37,7 @@ class PendingChallenge:
     cipher: str
     congestion_control: str
     cleartext: str
+    ustp2beta: str
     session_id: str
     token: str
     created_ts: float
@@ -53,6 +55,9 @@ class ClientSession:
     session_id: str
     session_reply: bytes
     cleartext: bool
+    ustp2beta: bool
+    data_addr: tuple[str, int] | None = None
+    data_ready: bool = False
     last_seen_ts: float = time.time()
 
 
@@ -73,13 +78,13 @@ def b64u(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
-def parse_hello_options(raw: bytes) -> tuple[str | None, str | None, str | None]:
+def parse_hello_options(raw: bytes) -> tuple[str | None, str | None, str | None, str | None]:
     if not raw:
-        return None, None, None
+        return None, None, None, None
     try:
         text = raw.decode("ascii", "replace")
     except Exception:
-        return None, None, None
+        return None, None, None, None
     parts = text.split("\0")
     cipher_text = parts[0] if parts else ""
     cipher = None
@@ -90,6 +95,7 @@ def parse_hello_options(raw: bytes) -> tuple[str | None, str | None, str | None]
             cipher = None
     cc_mode = None
     cleartext_mode = None
+    ustp2beta = None
     for part in parts[1:]:
         if part.startswith("cc="):
             value = part[3:].strip().lower()
@@ -99,7 +105,11 @@ def parse_hello_options(raw: bytes) -> tuple[str | None, str | None, str | None]
             value = part[3:].strip().lower()
             if value in {"on", "off"}:
                 cleartext_mode = value
-    return cipher, cc_mode, cleartext_mode
+        elif part.startswith("u2="):
+            value = part[3:].strip().lower()
+            if value in {"on", "off"}:
+                ustp2beta = value
+    return cipher, cc_mode, cleartext_mode, ustp2beta
 
 
 def parse_client_hello(payload: bytes):
@@ -111,23 +121,30 @@ def parse_client_hello(payload: bytes):
         cipher = None
         cc_mode = None
         cleartext = None
+        ustp2beta = None
         if len(rest) > 32:
-            cipher, cc_mode, cleartext = parse_hello_options(rest[32:])
-        return ("init", client_pub, cipher, cc_mode, cleartext)
+            cipher, cc_mode, cleartext, ustp2beta = parse_hello_options(rest[32:])
+        return ("init", client_pub, cipher, cc_mode, cleartext, ustp2beta)
     if payload.startswith(RESPONSE_PREFIX):
         rest = payload[len(RESPONSE_PREFIX):]
-        parts = rest.split(b"\0", 5)
-        if len(parts) != 6 or len(parts[5]) != 32:
+        parts = rest.split(b"\0", 6)
+        if len(parts) != 7 or len(parts[6]) != 32:
             return None
         try:
             token = parts[0].decode("ascii", "replace")
             session_id = parts[1].decode("ascii", "replace")
-            cipher, cc_mode, cleartext = parse_hello_options(parts[2] + b"\0" + parts[3] + b"\0" + parts[4])
+            cipher, cc_mode, cleartext, ustp2beta = parse_hello_options(parts[2] + b"\0" + parts[3] + b"\0" + parts[4] + b"\0" + parts[5])
             if cipher is None:
                 return None
         except Exception:
             return None
-        return ("challenge_reply", token, session_id, parts[5], cipher, cc_mode, cleartext)
+        return ("challenge_reply", token, session_id, parts[6], cipher, cc_mode, cleartext, ustp2beta)
+    if payload.startswith(DATA_PORT_PREFIX):
+        rest = payload[len(DATA_PORT_PREFIX):]
+        try:
+            return ("data_ready", rest.decode("ascii", "replace"))
+        except Exception:
+            return None
     return None
 
 
@@ -140,6 +157,14 @@ def resolve_server_cc_mode(server_mode: str, client_mode: str | None) -> str:
 
 
 def resolve_server_cleartext_mode(server_mode: str, client_mode: str | None) -> str:
+    if server_mode == "on":
+        return "on"
+    if server_mode == "off":
+        return "off"
+    return "on" if client_mode == "on" else "off"
+
+
+def resolve_server_ustp2beta_mode(server_mode: str, client_mode: str | None) -> str:
     if server_mode == "on":
         return "on"
     if server_mode == "off":
@@ -225,6 +250,8 @@ def build_systemd_unit(args: argparse.Namespace) -> str:
         cmd.extend(["--congestion-control", args.congestion_control])
     if args.cleartext != "auto":
         cmd.extend(["--cleartext", args.cleartext])
+    if args.ustp2beta != "auto":
+        cmd.extend(["--ustp2beta", args.ustp2beta])
     if args.host_key_file != os.path.expanduser("~/.uping_host_key"):
         cmd.extend(["--host-key-file", args.host_key_file])
     if args.window != 256:
@@ -286,6 +313,7 @@ def main() -> None:
     ap.add_argument("--cipher", default="auto", help="auto | chacha20 | aes-256-gcm | aes-128-gcm")
     ap.add_argument("--congestion-control", choices=["auto", "on", "off"], default="auto")
     ap.add_argument("--cleartext", choices=["auto", "on", "off"], default="auto")
+    ap.add_argument("--ustp2beta", choices=["auto", "on", "off"], default="auto")
     ap.add_argument("--host-key-file", default=os.path.expanduser("~/.uping_host_key"))
     ap.add_argument("--window", type=int, default=256)
     ap.add_argument("--rto", type=float, default=0.20)
@@ -306,16 +334,18 @@ def main() -> None:
 
     print(f"[UPING-SERVER] listening on {args.bind_ip}:{args.bind_port}")
 
-    def send_challenge(addr: tuple[str, int], client_pub_raw: bytes, requested_cipher: str | None, requested_cc: str | None, requested_cleartext: str | None) -> None:
+    def send_challenge(addr: tuple[str, int], client_pub_raw: bytes, requested_cipher: str | None, requested_cc: str | None, requested_cleartext: str | None, requested_u2: str | None) -> None:
         cipher = selected_cipher or requested_cipher or "chacha20"
         cc_mode = resolve_server_cc_mode(args.congestion_control, requested_cc)
         cleartext_mode = resolve_server_cleartext_mode(args.cleartext, requested_cleartext)
+        ustp2beta_mode = resolve_server_ustp2beta_mode(args.ustp2beta, requested_u2)
         challenge = PendingChallenge(
             addr=addr,
             client_pub=client_pub_raw,
             cipher=cipher,
             congestion_control=cc_mode,
             cleartext=cleartext_mode,
+            ustp2beta=ustp2beta_mode,
             session_id=b64u(secrets.token_bytes(18)),
             token=b64u(secrets.token_bytes(18)),
             created_ts=time.time(),
@@ -332,6 +362,8 @@ def main() -> None:
             + challenge.congestion_control.encode("ascii")
             + b"\0ct="
             + challenge.cleartext.encode("ascii")
+            + b"\0u2="
+            + challenge.ustp2beta.encode("ascii")
             + b"\0"
             + host_public
         )
@@ -359,6 +391,8 @@ def main() -> None:
             + challenge.congestion_control.encode("ascii")
             + b"\0ct="
             + challenge.cleartext.encode("ascii")
+            + b"\0u2="
+            + challenge.ustp2beta.encode("ascii")
             + b"\0"
             + host_public
         )
@@ -385,6 +419,7 @@ def main() -> None:
             session_id=challenge.session_id,
             session_reply=session_reply,
             cleartext=(challenge.cleartext == "on"),
+            ustp2beta=(challenge.ustp2beta == "on"),
             last_seen_ts=time.time(),
         )
         sessions[addr] = session
@@ -408,12 +443,12 @@ def main() -> None:
                 if parsed is None:
                     continue
                 if parsed[0] == "init":
-                    _, client_pub, requested_cipher, requested_cc, requested_cleartext = parsed
+                    _, client_pub, requested_cipher, requested_cc, requested_cleartext, requested_u2 = parsed
                     with sessions_lock:
-                        send_challenge(addr, client_pub, requested_cipher, requested_cc, requested_cleartext)
+                        send_challenge(addr, client_pub, requested_cipher, requested_cc, requested_cleartext, requested_u2)
                     continue
                 if parsed[0] == "challenge_reply":
-                    _, token, session_id, client_pub, requested_cipher, requested_cc, requested_cleartext = parsed
+                    _, token, session_id, client_pub, requested_cipher, requested_cc, requested_cleartext, requested_u2 = parsed
                     with sessions_lock:
                         pending = pending_challenges.get(addr)
                         if (
@@ -424,10 +459,23 @@ def main() -> None:
                             or pending.cipher != requested_cipher
                             or pending.congestion_control != (requested_cc or pending.congestion_control)
                             or pending.cleartext != (requested_cleartext or pending.cleartext)
+                            or pending.ustp2beta != (requested_u2 or pending.ustp2beta)
                         ):
                             continue
                         new_session(addr, pending)
                         pending_challenges.pop(addr, None)
+                    continue
+                if parsed[0] == "data_ready":
+                    _, ready_session_id = parsed
+                    with sessions_lock:
+                        for session in sessions.values():
+                            if session.session_id == ready_session_id and session.ustp2beta and session.addr[0] == addr[0]:
+                                session.data_addr = addr
+                                session.data_ready = True
+                                session.sender.peer = addr
+                                sock.set_peer_psk(addr, session.session_psk, session.cipher, cleartext=session.cleartext)
+                                print(f"[UPING-SERVER] ustp2 data path ready control={session.addr[0]}:{session.addr[1]} data={addr[0]}:{addr[1]}")
+                                break
                     continue
 
             with sessions_lock:
