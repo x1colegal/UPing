@@ -70,6 +70,8 @@ class USTPSender:
         self.wakeup = threading.Event()
         self.stats_acks = 0
         self.stats_rto = 0
+        self.stats_recovered = 0
+        self.stats_retransmissions = 0
         self.nack_ts: Dict[int, float] = {}
         now = time.time()
         self.last_ack_ts = now
@@ -163,6 +165,7 @@ class USTPSender:
                     now = time.time()
                     it.last_sent = now
                     it.retransmitted = True
+                    self.stats_retransmissions += 1
                 elif self.pending:
                     payload, ext_stream_pos = self.pending.popleft()
                     seq = self.next_seq
@@ -203,6 +206,8 @@ class USTPSender:
                 for seq in acked:
                     item = self.sent.pop(seq, None)
                     if item is not None:
+                        if item.retransmitted:
+                            self.stats_recovered += 1
                         if not item.retransmitted:
                             sample = time.time() - item.first_sent
                             self._update_rto(sample)
@@ -354,6 +359,8 @@ class USTPSender:
                 "acks": float(self.stats_acks),
                 "nack": float(self.stats_nack),
                 "rto_events": float(self.stats_rto),
+                "recovered_packets": float(self.stats_recovered),
+                "retransmissions": float(self.stats_retransmissions),
                 "inflight": float(len(self.sent)),
                 "pending": float(len(self.pending)),
                 "last_ack_age": max(0.0, time.time() - self.last_ack_ts),
@@ -382,6 +389,13 @@ class USTPReceiver:
         self.pending_ack_set: Set[int] = set()
         self.last_ack_flush_ts = time.time()
         self.nack_ts: Dict[int, float] = {}
+        self.missing_first_seen: Dict[int, float] = {}
+        self.nack_attempts: Dict[int, int] = {}
+        self.abandoned_seq: Set[int] = set()
+        self.recovered_packets = 0
+        self.abandoned_packets = 0
+        self.max_nack_attempts = 8
+        self.reorder_grace = 0.05
         self.last_data_ts = 0.0
         self.data_count = 0
         self.last_max_seq = 0
@@ -400,6 +414,11 @@ class USTPReceiver:
         self.pending_ack_set.clear()
         self.last_ack_flush_ts = time.time()
         self.nack_ts.clear()
+        self.missing_first_seen.clear()
+        self.nack_attempts.clear()
+        self.abandoned_seq.clear()
+        self.recovered_packets = 0
+        self.abandoned_packets = 0
         self.last_data_ts = 0.0
         self.data_count = 0
         self.last_max_seq = 0
@@ -422,6 +441,18 @@ class USTPReceiver:
     def handle_data(self, pkt: USTPPacket) -> bytes:
         seq = pkt.seq
         pos = pkt.stream_pos
+        recovered_now = False
+        if seq in self.missing_first_seen:
+            self.missing_first_seen.pop(seq, None)
+            self.nack_attempts.pop(seq, None)
+            self.nack_ts.pop(seq, None)
+            recovered_now = True
+        if seq in self.abandoned_seq:
+            self.abandoned_seq.discard(seq)
+            self.abandoned_packets = max(0, self.abandoned_packets - 1)
+            recovered_now = True
+        if recovered_now:
+            self.recovered_packets += 1
 
         # ACK in small batches to reduce control overhead.
         if seq not in self.received_seq:
@@ -492,6 +523,12 @@ class USTPReceiver:
         if self.last_data_ts and (now - self.last_data_ts) > self.idle_clear_after:
             self.received_seq.clear()
             self.nack_ts.clear()
+            for seq in self.missing_first_seen:
+                if seq not in self.abandoned_seq:
+                    self.abandoned_seq.add(seq)
+                    self.abandoned_packets += 1
+            self.missing_first_seen.clear()
+            self.nack_attempts.clear()
             self.seq_to_pos.clear()
             self.buffer_by_pos.clear()
             return
@@ -504,12 +541,23 @@ class USTPReceiver:
             mn = mx - 512
         missing_batch = []
         for s in range(mn, mx):
-            if s in self.received_seq:
+            if s in self.received_seq or s in self.abandoned_seq:
+                continue
+            first_seen = self.missing_first_seen.setdefault(s, now)
+            if now - first_seen < self.reorder_grace:
+                continue
+            attempts = self.nack_attempts.get(s, 0)
+            if attempts >= self.max_nack_attempts:
+                self.abandoned_seq.add(s)
+                self.abandoned_packets += 1
+                self.missing_first_seen.pop(s, None)
+                self.nack_ts.pop(s, None)
                 continue
             last = self.nack_ts.get(s, 0.0)
             if now - last < 0.5:
                 continue
             self.nack_ts[s] = now
+            self.nack_attempts[s] = attempts + 1
             missing_batch.append(s)
             print(f"[USTP-RECV] missing seq={s}, requesting retransmit")
             if len(missing_batch) >= ACK_BATCH_MAX:
@@ -525,6 +573,12 @@ class USTPReceiver:
             else:
                 self.sock.sendto(nack.to_bytes(), self.peer)
             print(f"[USTP-RECV] NACK sent={len(missing_batch)}")
+
+    def get_stats(self) -> Dict[str, int]:
+        return {
+            "recovered_packets": self.recovered_packets,
+            "abandoned_packets": self.abandoned_packets,
+        }
 
 
 def parse_packet(raw: bytes) -> Optional[USTPPacket]:

@@ -256,7 +256,7 @@ def build_systemd_unit(args: argparse.Namespace) -> str:
         cmd.extend(["--host-key-file", args.host_key_file])
     if args.window != 256:
         cmd.extend(["--window", str(args.window)])
-    if args.rto != 0.20:
+    if args.rto != 0.25:
         cmd.extend(["--rto", str(args.rto)])
     exec_start = " ".join(shlex.quote(part) for part in cmd)
     return (
@@ -316,7 +316,7 @@ def main() -> None:
     ap.add_argument("--ustp2beta", choices=["auto", "on", "off"], default="auto")
     ap.add_argument("--host-key-file", default=os.path.expanduser("~/.uping_host_key"))
     ap.add_argument("--window", type=int, default=256)
-    ap.add_argument("--rto", type=float, default=0.20)
+    ap.add_argument("--rto", type=float, default=0.25)
     ap.add_argument("--loss", type=int, default=0, help="Simulated outbound packet loss percent (0-100)")
     args = ap.parse_args()
 

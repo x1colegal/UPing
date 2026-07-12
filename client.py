@@ -3,6 +3,7 @@ import errno
 import ipaddress
 import json
 import os
+import select
 import socket
 import time
 from dataclasses import dataclass
@@ -331,7 +332,7 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
                         sock=usock_candidate,
                         peer=addr,
                         window=256,
-                        rto=0.20,
+                        rto=0.25,
                         max_burst=256,
                         pump_interval=0.001,
                         congestion_control=(negotiated_cc == "on"),
@@ -366,11 +367,6 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
 
 
 def close_transport(handle: TransportHandle) -> None:
-    try:
-        if handle.sender is not None:
-            handle.sender.queue_payload(encode_frame(TYPE_PING, 0, 0, time.monotonic_ns(), b"bye"))
-    except Exception:
-        pass
     try:
         if handle.usock is not None and handle.peer is not None:
             handle.usock.send_plain(mkp(TYPE_CLOSE, payload=b"BYE").to_bytes(), handle.peer)
@@ -478,10 +474,20 @@ def main() -> None:
                     while time.time() < deadline:
                         try:
                             if handle.ustp2beta_active and handle.data_usock is not None:
-                                try:
-                                    raw, _addr = handle.data_usock.recvfrom(65535)
-                                except socket.timeout:
+                                readable, _, _ = select.select(
+                                    [handle.raw_sock, handle.raw_data_sock],
+                                    [],
+                                    [],
+                                    min(0.2, max(0.0, deadline - time.time())),
+                                )
+                                if not readable:
+                                    continue
+                                # Drain control first so ACKs cannot starve behind
+                                # a continuous stream of USTP/2 DATA packets.
+                                if handle.raw_sock in readable:
                                     raw, _addr = handle.usock.recvfrom(65535)
+                                else:
+                                    raw, _addr = handle.data_usock.recvfrom(65535)
                             else:
                                 raw, _addr = handle.usock.recvfrom(65535)
                         except socket.timeout:
@@ -532,8 +538,16 @@ def main() -> None:
         rtts = label_stats["rtts"]
         assert isinstance(rtts, list)
         loss = ((sent - received) / sent * 100.0) if sent else 0.0
+        receiver_stats = handle.receiver.get_stats()
+        sender_stats = handle.sender.get_stats()
+        receiver_gave_up = max(sent - received, receiver_stats["abandoned_packets"])
         print(f"\n--- {args.peer_ip} UPing statistics [{handle.label}] ---")
-        print(f"{sent} packets transmitted, {received} received, {loss:.1f}% packet loss")
+        print(
+            f"{sent} packets transmitted, {received} received, {loss:.1f}% packet loss "
+            f"({receiver_gave_up} packets abandoned by receiver)"
+        )
+        recovered = receiver_stats["recovered_packets"] + int(sender_stats["recovered_packets"])
+        print(f"{recovered} transport packets lost but recovered by retransmission")
         if rtts:
             print(f"rtt min/avg/max = {min(rtts):.2f}/{(sum(rtts)/len(rtts)):.2f}/{max(rtts):.2f} ms")
 
