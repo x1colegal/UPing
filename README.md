@@ -4,12 +4,18 @@
 
 It is a ping-like tool built on top of **USTP-Secure**.
 
+## News
+
+**16/07/2026: USTP/2 Beta discontinued in UPing.**
+
+USTP/2 Beta was removed because its split DATA/control sockets proved much more unstable than USTP/1.1, including control-packet starvation and false RTO bursts. UPing now supports only the stable USTP/1.1 transport.
+
 ## What it does
 
 - uses `USTPS` as the transport
 - server listens on port `40002` by default
 - client sends ping frames and measures RTT over the secure transport
-- supports stable `USTP/1.1` and optional `USTP/2 Beta`
+- supports stable `USTP/1.1`
 
 ## Address family behavior
 
@@ -66,12 +72,6 @@ Allow negotiated cleartext + HMAC mode:
 python3 server.py --start --cleartext auto
 ```
 
-Allow negotiated `USTP/2 Beta`:
-
-```bash
-python3 server.py --start --ustp2beta auto
-```
-
 ## Client
 
 Default:
@@ -116,18 +116,6 @@ Request cleartext + HMAC mode:
 python3 client.py --peer-ip x1co.com.br --cleartext on
 ```
 
-Request `USTP/2 Beta`:
-
-```bash
-python3 client.py --peer-ip x1co.com.br --ustp2beta on
-```
-
-Test `USTP/1.1` and `USTP/2 Beta` simultaneously:
-
-```bash
-python3 client.py --peer-ip x1co.com.br --test-ustp2beta-and-ustp1.1-simultaneously
-```
-
 ## Notes
 
 - this uses `USTPS`, not raw ICMP
@@ -135,13 +123,8 @@ python3 client.py --peer-ip x1co.com.br --test-ustp2beta-and-ustp1.1-simultaneou
 - default client/server cipher is `chacha20`
 - client now negotiates `--congestion-control on|off`
 - client now negotiates `--cleartext on|off`
-- client can negotiate `--ustp2beta on|off`
-- `--test-ustp2beta-and-ustp1.1-simultaneously` opens two sessions at the same time:
-  - one stable `USTP/1.1`
-  - one `USTP/2 Beta`
-- in `USTP/2 Beta`, the client still keeps transport semantics unordered and selective-retransmit, but it opens:
-  - one socket for control packets
-  - one socket for inbound `DATA`
+- `UNORD` means a new DATA packet arrived outside the expected sequence; that packet was received and does not need retransmission
+- `DUPLICATE` means the DATA sequence was already received; the duplicate is discarded and not delivered again
 - the tool measures RTT of the whole `USTPS` path, not bare UDP alone
 - the client output is intentionally ping-like, but it reports `USTPS` session information instead of ICMP fields
 - `--loss` simulates outbound packet loss on the server side for testing
