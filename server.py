@@ -24,6 +24,7 @@ HELLO_PREFIX = b"USTPS-KEX1\0"
 CHALLENGE_PREFIX = b"USTPS-CHALLENGE1\0"
 RESPONSE_PREFIX = b"USTPS-CHALLENGE-REPLY1\0"
 SESSION_PREFIX = b"USTPS-SESSION1\0"
+RTT_PROBE_PREFIX = b"USTPS-RTT1\0"
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 DEFAULT_PORT = 40002
 SYSTEMD_UNIT_PATH = "/etc/systemd/system/uping-server.service"
@@ -404,6 +405,11 @@ def main() -> None:
                     session.last_seen_ts = time.time()
 
             if pkt.pkt_type == TYPE_HELLO:
+                if pkt.payload.startswith(RTT_PROBE_PREFIX):
+                    probe = pkt.payload[len(RTT_PROBE_PREFIX) :]
+                    if session is not None and len(probe) == 8:
+                        sock.send_plain(mkp(TYPE_HELLO, payload=RTT_PROBE_PREFIX + probe).to_bytes(), addr)
+                    continue
                 parsed = parse_client_hello(pkt.payload)
                 if parsed is None:
                     continue

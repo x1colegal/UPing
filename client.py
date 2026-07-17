@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import socket
+import struct
 import time
 from dataclasses import dataclass
 
@@ -22,6 +23,7 @@ HELLO_PREFIX = b"USTPS-KEX1\0"
 CHALLENGE_PREFIX = b"USTPS-CHALLENGE1\0"
 RESPONSE_PREFIX = b"USTPS-CHALLENGE-REPLY1\0"
 SESSION_PREFIX = b"USTPS-SESSION1\0"
+RTT_PROBE_PREFIX = b"USTPS-RTT1\0"
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 DEFAULT_PORT = 40002
 
@@ -408,6 +410,8 @@ def main() -> None:
                 seq += 1
                 for handle in transports:
                     sent_ns = time.monotonic_ns()
+                    probe = RTT_PROBE_PREFIX + struct.pack("!Q", sent_ns)
+                    handle.usock.send_plain(mkp(TYPE_HELLO, payload=probe).to_bytes(), handle.peer)
                     frame = encode_frame(TYPE_PING, 1, seq, sent_ns, payload)
                     handle.sender.queue_payload(frame)
                     stats[handle.label]["sent"] = int(stats[handle.label]["sent"]) + 1
@@ -423,6 +427,14 @@ def main() -> None:
                             continue
                         if pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST):
                             handle.sender.on_control(pkt)
+                            continue
+                        if pkt.pkt_type == TYPE_HELLO and pkt.payload.startswith(RTT_PROBE_PREFIX):
+                            echoed = pkt.payload[len(RTT_PROBE_PREFIX) :]
+                            if len(echoed) == 8:
+                                probe_ns = struct.unpack("!Q", echoed)[0]
+                                sample = (time.monotonic_ns() - probe_ns) / 1_000_000_000.0
+                                if 0.0 < sample <= 3.0:
+                                    handle.receiver.observe_rtt(sample)
                             continue
                         if pkt.pkt_type == TYPE_CLOSE:
                             raise SystemExit(f"server closed the UPing session ({handle.label})")
