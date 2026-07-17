@@ -454,15 +454,18 @@ class USTPReceiver:
         if recovered_now:
             self.recovered_packets += 1
 
-        # ACK in small batches to reduce control overhead.
-        if seq not in self.received_seq:
+        is_new = seq not in self.received_seq
+
+        # Re-ACK duplicates immediately. They normally mean that the original
+        # ACK was lost; discarding them silently would keep the sender in RTO.
+        if is_new:
             self.received_seq.add(seq)
-            if seq not in self.pending_ack_set:
-                self.pending_ack.append(seq)
-                self.pending_ack_set.add(seq)
-            now = time.time()
-            if len(self.pending_ack) >= ACK_BATCH_MAX or (now - self.last_ack_flush_ts) >= ACK_FLUSH_INTERVAL:
-                self.flush_acks(now)
+        if seq not in self.pending_ack_set:
+            self.pending_ack.append(seq)
+            self.pending_ack_set.add(seq)
+        now = time.time()
+        if not is_new or len(self.pending_ack) >= ACK_BATCH_MAX or (now - self.last_ack_flush_ts) >= ACK_FLUSH_INTERVAL:
+            self.flush_acks(now)
 
         if seq in self.seq_to_pos:
             return b""

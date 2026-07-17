@@ -428,11 +428,13 @@ def main() -> None:
                             raise SystemExit(f"server closed the UPing session ({handle.label})")
                         if pkt.pkt_type != TYPE_DATA:
                             continue
-                        if pkt.seq in handle.receiver.received_seq:
+                        is_duplicate = pkt.seq in handle.receiver.received_seq
+                        was_requested = pkt.seq in handle.receiver.missing_first_seen
+                        if is_duplicate:
                             print(f"[{handle.label}] DUPLICATE seq={pkt.seq}: packet already received; discarded")
                         else:
                             expected_seq = handle.receiver.last_max_seq + 1 if handle.receiver.last_max_seq else pkt.seq
-                            if pkt.seq != expected_seq:
+                            if pkt.seq != expected_seq and not was_requested:
                                 print(
                                     f"[{handle.label}] UNORD seq={pkt.seq} expected={expected_seq}: "
                                     "packet received out of order; no retransmission needed for this packet"
