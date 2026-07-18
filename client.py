@@ -21,7 +21,6 @@ from ustp import USTPReceiver, USTPSender, parse_packet
 HELLO_PREFIX = b"USTPS-KEX1 "
 CHALLENGE_PREFIX = b"USTPS-CHALLENGE1 "
 RESPONSE_PREFIX = b"USTPS-CHALLENGE-REPLY1 "
-RESUME_PREFIX = b"USTPS-RESUME1 "
 SESSION_PREFIX = b"USTPS-SESSION1 "
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 DEFAULT_PORT = 40002
@@ -177,6 +176,30 @@ def family_name(family: int) -> str:
     return "IPv6" if family == socket.AF_INET6 else "IPv4"
 
 
+def is_temporary_network_error(exc: OSError) -> bool:
+    return exc.errno in (
+        errno.ENETUNREACH,
+        errno.EHOSTUNREACH,
+        errno.ENETDOWN,
+        errno.EADDRNOTAVAIL,
+        errno.ENODEV,
+    )
+
+
+def is_recoverable_socket_error(exc: BaseException) -> bool:
+    if isinstance(exc, socket.timeout):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return is_temporary_network_error(exc) or exc.errno in (
+        errno.EBADF,
+        errno.ENOTCONN,
+        errno.ECONNRESET,
+        errno.ECONNREFUSED,
+        errno.EPIPE,
+    )
+
+
 def connect_transport(args, selected_cipher: str, client_private, client_pub: bytes, tofu_label: str, force_family: int | None):
     candidates = resolve_peer_candidates(args.peer_ip, args.peer_port, force_family)
     if not candidates:
@@ -185,6 +208,7 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
     for family, sockaddr in candidates:
         print(f"[UPING] trying {family_name(family)} {sockaddr[0]}:{sockaddr[1]}")
         raw_candidate = None
+        family_temporarily_unavailable = False
         try:
             raw_candidate = bind_udp_socket(args.bind_ip, args.bind_port, family)
             raw_candidate.settimeout(0.2)
@@ -195,23 +219,34 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
             while time.time() < deadline:
                 now = time.time()
                 if not challenge_reply_sent and (now - last_hello_ts) >= 0.2:
-                    usock_candidate.send_plain(
-                        mkp(
-                            TYPE_HELLO,
-                            payload=encode_transport_hello(
-                                client_pub,
-                                selected_cipher,
-                                args.congestion_control,
-                                args.cleartext,
-                            ),
-                        ).to_bytes(),
-                        sockaddr,
-                    )
+                    try:
+                        usock_candidate.send_plain(
+                            mkp(
+                                TYPE_HELLO,
+                                payload=encode_transport_hello(
+                                    client_pub,
+                                    selected_cipher,
+                                    args.congestion_control,
+                                    args.cleartext,
+                                ),
+                            ).to_bytes(),
+                            sockaddr,
+                        )
+                    except OSError as exc:
+                        if is_temporary_network_error(exc):
+                            family_temporarily_unavailable = True
+                            break
+                        raise
                     last_hello_ts = now
                 try:
                     raw, addr = usock_candidate.recvfrom(65535)
                 except socket.timeout:
                     continue
+                except OSError as exc:
+                    if is_recoverable_socket_error(exc):
+                        family_temporarily_unavailable = True
+                        break
+                    raise
                 pkt = parse_packet(raw)
                 if pkt is None or pkt.pkt_type != TYPE_HELLO:
                     continue
@@ -240,7 +275,13 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
                         ct=negotiated_cleartext,
                         pub=b64u(client_pub),
                     )
-                    usock_candidate.send_plain(mkp(TYPE_HELLO, payload=reply).to_bytes(), addr)
+                    try:
+                        usock_candidate.send_plain(mkp(TYPE_HELLO, payload=reply).to_bytes(), addr)
+                    except OSError as exc:
+                        if is_temporary_network_error(exc):
+                            family_temporarily_unavailable = True
+                            break
+                        raise
                     challenge_reply_sent = True
                     continue
                 if pkt.payload.startswith(SESSION_PREFIX):
@@ -296,7 +337,8 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
                 except Exception:
                     pass
         if (family, sockaddr) != candidates[-1]:
-            print(f"[UPING] fallback to next address after trying {sockaddr[0]} (timeout/no reply)")
+            reason = "temporary network error" if family_temporarily_unavailable else "timeout/no reply"
+            print(f"[UPING] fallback to next address after trying {sockaddr[0]} ({reason})")
     if last_error is not None:
         raise last_error
     raise SystemExit("UPing connection failed")
