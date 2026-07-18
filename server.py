@@ -20,11 +20,10 @@ from uping_proto import TYPE_PING, TYPE_PONG, decode_frame, encode_frame
 from ustp import USTPReceiver, USTPSender, parse_packet
 
 
-HELLO_PREFIX = b"USTPS-KEX1\0"
-CHALLENGE_PREFIX = b"USTPS-CHALLENGE1\0"
-RESPONSE_PREFIX = b"USTPS-CHALLENGE-REPLY1\0"
-SESSION_PREFIX = b"USTPS-SESSION1\0"
-RTT_PROBE_PREFIX = b"USTPS-RTT1\0"
+HELLO_PREFIX = b"USTPS-KEX1 "
+CHALLENGE_PREFIX = b"USTPS-CHALLENGE1 "
+RESPONSE_PREFIX = b"USTPS-CHALLENGE-REPLY1 "
+SESSION_PREFIX = b"USTPS-SESSION1 "
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 DEFAULT_PORT = 40002
 SYSTEMD_UNIT_PATH = "/etc/systemd/system/uping-server.service"
@@ -74,61 +73,57 @@ def b64u(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
-def parse_hello_options(raw: bytes) -> tuple[str | None, str | None, str | None]:
-    if not raw:
-        return None, None, None
+def b64u_decode(text: str) -> bytes:
+    padded = text + ("=" * (-len(text) % 4))
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def encode_ascii_record(prefix: bytes, **fields: str) -> bytes:
+    parts = [prefix.rstrip()]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}".encode("ascii"))
+    return b" ".join(parts)
+
+
+def parse_ascii_record(payload: bytes, prefix: bytes) -> dict[str, str] | None:
+    if not payload.startswith(prefix):
+        return None
     try:
-        text = raw.decode("ascii", "replace")
+        text = payload[len(prefix) :].decode("ascii")
     except Exception:
-        return None, None, None
-    parts = text.split("\0")
-    cipher_text = parts[0] if parts else ""
-    cipher = None
-    if cipher_text:
-        try:
-            cipher = normalize_cipher_name(cipher_text)
-        except Exception:
-            cipher = None
-    cc_mode = None
-    cleartext_mode = None
-    for part in parts[1:]:
-        if part.startswith("cc="):
-            value = part[3:].strip().lower()
-            if value in {"on", "off"}:
-                cc_mode = value
-        elif part.startswith("ct="):
-            value = part[3:].strip().lower()
-            if value in {"on", "off"}:
-                cleartext_mode = value
-    return cipher, cc_mode, cleartext_mode
+        return None
+    out: dict[str, str] = {}
+    for token in text.split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        out[key] = value
+    return out
 
 
 def parse_client_hello(payload: bytes):
-    if payload.startswith(HELLO_PREFIX):
-        rest = payload[len(HELLO_PREFIX):]
-        if len(rest) < 32:
-            return None
-        client_pub = rest[:32]
-        cipher = None
-        cc_mode = None
-        cleartext = None
-        if len(rest) > 32:
-            cipher, cc_mode, cleartext = parse_hello_options(rest[32:])
-        return ("init", client_pub, cipher, cc_mode, cleartext)
-    if payload.startswith(RESPONSE_PREFIX):
-        rest = payload[len(RESPONSE_PREFIX):]
-        parts = rest.split(b"\0", 5)
-        if len(parts) != 6 or len(parts[5]) != 32:
-            return None
+    fields = parse_ascii_record(payload, HELLO_PREFIX)
+    if fields is not None:
         try:
-            token = parts[0].decode("ascii", "replace")
-            session_id = parts[1].decode("ascii", "replace")
-            cipher, cc_mode, cleartext = parse_hello_options(parts[2] + b"\0" + parts[3] + b"\0" + parts[4])
-            if cipher is None:
-                return None
+            client_pub = b64u_decode(fields["pub"])
         except Exception:
             return None
-        return ("challenge_reply", token, session_id, parts[5], cipher, cc_mode, cleartext)
+        cipher = normalize_cipher_name(fields.get("cipher", "chacha20"))
+        cc_mode = fields.get("cc")
+        cleartext = fields.get("ct")
+        return ("init", client_pub, cipher, cc_mode, cleartext)
+    fields = parse_ascii_record(payload, RESPONSE_PREFIX)
+    if fields is not None:
+        try:
+            token = fields["token"]
+            session_id = fields["session"]
+            client_pub = b64u_decode(fields["pub"])
+            cipher = normalize_cipher_name(fields["cipher"])
+        except Exception:
+            return None
+        cc_mode = fields.get("cc")
+        cleartext = fields.get("ct")
+        return ("challenge_reply", token, session_id, client_pub, cipher, cc_mode, cleartext)
     return None
 
 
@@ -230,7 +225,7 @@ def build_systemd_unit(args: argparse.Namespace) -> str:
         cmd.extend(["--host-key-file", args.host_key_file])
     if args.window != 256:
         cmd.extend(["--window", str(args.window)])
-    if args.rto != 0.25:
+    if args.rto != 0.20:
         cmd.extend(["--rto", str(args.rto)])
     exec_start = " ".join(shlex.quote(part) for part in cmd)
     return (
@@ -289,7 +284,7 @@ def main() -> None:
     ap.add_argument("--cleartext", choices=["auto", "on", "off"], default="auto")
     ap.add_argument("--host-key-file", default=os.path.expanduser("~/.uping_host_key"))
     ap.add_argument("--window", type=int, default=256)
-    ap.add_argument("--rto", type=float, default=0.25)
+    ap.add_argument("--rto", type=float, default=0.20)
     ap.add_argument("--loss", type=int, default=0, help="Simulated outbound packet loss percent (0-100)")
     args = ap.parse_args()
 
@@ -322,19 +317,14 @@ def main() -> None:
             created_ts=time.time(),
         )
         pending_challenges[addr] = challenge
-        payload = (
-            CHALLENGE_PREFIX
-            + challenge.token.encode("ascii")
-            + b"\0"
-            + challenge.session_id.encode("ascii")
-            + b"\0"
-            + challenge.cipher.encode("ascii")
-            + b"\0cc="
-            + challenge.congestion_control.encode("ascii")
-            + b"\0ct="
-            + challenge.cleartext.encode("ascii")
-            + b"\0"
-            + host_public
+        payload = encode_ascii_record(
+            CHALLENGE_PREFIX,
+            token=challenge.token,
+            session=challenge.session_id,
+            cipher=challenge.cipher,
+            cc=challenge.congestion_control,
+            ct=challenge.cleartext,
+            pub=b64u(host_public),
         )
         sock.send_plain(mkp(TYPE_HELLO, payload=payload).to_bytes(), addr)
 
@@ -351,17 +341,13 @@ def main() -> None:
     def new_session(addr: tuple[str, int], challenge: PendingChallenge) -> ClientSession:
         client_pub = x25519.X25519PublicKey.from_public_bytes(challenge.client_pub)
         session_psk = derive_session_key(host_private.exchange(client_pub), challenge.client_pub, host_public)
-        session_reply = (
-            SESSION_PREFIX
-            + challenge.session_id.encode("ascii")
-            + b"\0"
-            + challenge.cipher.encode("ascii")
-            + b"\0cc="
-            + challenge.congestion_control.encode("ascii")
-            + b"\0ct="
-            + challenge.cleartext.encode("ascii")
-            + b"\0"
-            + host_public
+        session_reply = encode_ascii_record(
+            SESSION_PREFIX,
+            session=challenge.session_id,
+            cipher=challenge.cipher,
+            cc=challenge.congestion_control,
+            ct=challenge.cleartext,
+            pub=b64u(host_public),
         )
         sock.send_plain(mkp(TYPE_HELLO, payload=session_reply).to_bytes(), addr)
         sock.set_peer_psk(addr, session_psk, challenge.cipher, cleartext=(challenge.cleartext == "on"))
@@ -405,11 +391,6 @@ def main() -> None:
                     session.last_seen_ts = time.time()
 
             if pkt.pkt_type == TYPE_HELLO:
-                if pkt.payload.startswith(RTT_PROBE_PREFIX):
-                    probe = pkt.payload[len(RTT_PROBE_PREFIX) :]
-                    if session is not None and len(probe) == 8:
-                        sock.send_plain(mkp(TYPE_HELLO, payload=RTT_PROBE_PREFIX + probe).to_bytes(), addr)
-                    continue
                 parsed = parse_client_hello(pkt.payload)
                 if parsed is None:
                     continue
@@ -435,6 +416,7 @@ def main() -> None:
                         new_session(addr, pending)
                         pending_challenges.pop(addr, None)
                     continue
+
             with sessions_lock:
                 session = sessions.get(addr)
             if session is None:

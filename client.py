@@ -1,12 +1,11 @@
 import argparse
+import base64
 import errno
 import ipaddress
 import json
 import os
 import socket
-import struct
 import time
-from dataclasses import dataclass
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -19,24 +18,12 @@ from uping_proto import TYPE_PING, TYPE_PONG, decode_frame, encode_frame
 from ustp import USTPReceiver, USTPSender, parse_packet
 
 
-HELLO_PREFIX = b"USTPS-KEX1\0"
-CHALLENGE_PREFIX = b"USTPS-CHALLENGE1\0"
-RESPONSE_PREFIX = b"USTPS-CHALLENGE-REPLY1\0"
-SESSION_PREFIX = b"USTPS-SESSION1\0"
-RTT_PROBE_PREFIX = b"USTPS-RTT1\0"
+HELLO_PREFIX = b"USTPS-KEX1 "
+CHALLENGE_PREFIX = b"USTPS-CHALLENGE1 "
+RESPONSE_PREFIX = b"USTPS-CHALLENGE-REPLY1 "
+SESSION_PREFIX = b"USTPS-SESSION1 "
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 DEFAULT_PORT = 40002
-
-
-@dataclass
-class TransportHandle:
-    raw_sock: socket.socket
-    usock: AEADDatagramSocket
-    peer: tuple
-    sender: USTPSender
-    receiver: USTPReceiver
-    family: int
-    label: str
 
 
 def public_bytes(pubkey) -> bytes:
@@ -52,45 +39,46 @@ def derive_session_key(shared: bytes, client_pub: bytes, server_pub: bytes) -> b
     ).derive(shared)
 
 
-def encode_transport_hello(client_pub: bytes, cipher: str, cc_mode: str, cleartext_mode: str) -> bytes:
-    return (
-        HELLO_PREFIX
-        + client_pub
-        + cipher.encode("ascii")
-        + b"\0cc="
-        + cc_mode.encode("ascii")
-        + b"\0ct="
-        + cleartext_mode.encode("ascii")
-    )
+def b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
-def parse_hello_options(raw: bytes) -> tuple[str | None, str | None, str | None]:
-    if not raw:
-        return None, None, None
+def b64u_decode(text: str) -> bytes:
+    padded = text + ("=" * (-len(text) % 4))
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def encode_ascii_record(prefix: bytes, **fields: str) -> bytes:
+    parts = [prefix.rstrip()]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}".encode("ascii"))
+    return b" ".join(parts)
+
+
+def parse_ascii_record(payload: bytes, prefix: bytes) -> dict[str, str] | None:
+    if not payload.startswith(prefix):
+        return None
     try:
-        text = raw.decode("ascii", "replace")
+        text = payload[len(prefix) :].decode("ascii")
     except Exception:
-        return None, None, None
-    parts = text.split("\0")
-    cipher_text = parts[0] if parts else ""
-    cipher = None
-    if cipher_text:
-        try:
-            cipher = normalize_cipher_name(cipher_text)
-        except Exception:
-            cipher = None
-    cc_mode = None
-    cleartext_mode = None
-    for part in parts[1:]:
-        if part.startswith("cc="):
-            value = part[3:].strip().lower()
-            if value in {"on", "off"}:
-                cc_mode = value
-        elif part.startswith("ct="):
-            value = part[3:].strip().lower()
-            if value in {"on", "off"}:
-                cleartext_mode = value
-    return cipher, cc_mode, cleartext_mode
+        return None
+    out: dict[str, str] = {}
+    for token in text.split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        out[key] = value
+    return out
+
+
+def encode_transport_hello(client_pub: bytes, cipher: str, cc_mode: str, cleartext_mode: str) -> bytes:
+    return encode_ascii_record(
+        HELLO_PREFIX,
+        pub=b64u(client_pub),
+        cipher=cipher,
+        cc=cc_mode,
+        ct=cleartext_mode,
+    )
 
 
 def load_tofu(path: str) -> dict[str, str]:
@@ -185,13 +173,13 @@ def family_name(family: int) -> str:
     return "IPv6" if family == socket.AF_INET6 else "IPv4"
 
 
-def connect_transport(args, selected_cipher: str, client_private, client_pub: bytes, tofu_label: str, force_family: int | None, label: str):
+def connect_transport(args, selected_cipher: str, client_private, client_pub: bytes, tofu_label: str, force_family: int | None):
     candidates = resolve_peer_candidates(args.peer_ip, args.peer_port, force_family)
     if not candidates:
         raise SystemExit("no UPing peer candidates")
     last_error = None
     for family, sockaddr in candidates:
-        print(f"[UPING][{label}] trying {family_name(family)} {sockaddr[0]}:{sockaddr[1]}")
+        print(f"[UPING] trying {family_name(family)} {sockaddr[0]}:{sockaddr[1]}")
         raw_candidate = None
         try:
             raw_candidate = bind_udp_socket(args.bind_ip, args.bind_port, family)
@@ -204,15 +192,7 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
                 now = time.time()
                 if not challenge_reply_sent and (now - last_hello_ts) >= 0.2:
                     usock_candidate.send_plain(
-                        mkp(
-                            TYPE_HELLO,
-                            payload=encode_transport_hello(
-                                client_pub,
-                                selected_cipher,
-                                args.congestion_control,
-                                args.cleartext,
-                            ),
-                        ).to_bytes(),
+                        mkp(TYPE_HELLO, payload=encode_transport_hello(client_pub, selected_cipher, "off", "off")).to_bytes(),
                         sockaddr,
                     )
                     last_hello_ts = now
@@ -224,95 +204,65 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
                 if pkt is None or pkt.pkt_type != TYPE_HELLO:
                     continue
                 if pkt.payload.startswith(CHALLENGE_PREFIX):
-                    rest = pkt.payload[len(CHALLENGE_PREFIX):]
-                    parts = rest.split(b"\0", 5)
-                    if len(parts) != 6 or len(parts[5]) != 32:
+                    fields = parse_ascii_record(pkt.payload, CHALLENGE_PREFIX)
+                    if not fields:
                         continue
-                    token = parts[0].decode("ascii", "replace")
-                    session_id = parts[1].decode("ascii", "replace")
-                    session_cipher, negotiated_cc, negotiated_cleartext = parse_hello_options(parts[2] + b"\0" + parts[3] + b"\0" + parts[4])
-                    session_cipher = session_cipher or selected_cipher
-                    server_pub = parts[5]
+                    token = fields.get("token", "")
+                    session_id = fields.get("session", "")
+                    session_cipher = normalize_cipher_name(fields.get("cipher", selected_cipher))
+                    negotiated_cc = fields.get("cc") or "off"
+                    negotiated_cleartext = fields.get("ct") or "off"
+                    try:
+                        server_pub = b64u_decode(fields["pub"])
+                    except Exception:
+                        continue
                     if session_cipher != selected_cipher:
                         raise SystemExit(f"server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
-                    if negotiated_cc != args.congestion_control:
-                        raise SystemExit(
-                            f"server negotiated unexpected congestion control mode {negotiated_cc}; expected {args.congestion_control}"
-                        )
-                    if negotiated_cleartext != args.cleartext:
-                        raise SystemExit(
-                            f"server negotiated unexpected cleartext mode {negotiated_cleartext}; expected {args.cleartext}"
-                        )
                     check_tofu(args.tofu_file, tofu_label, server_pub)
-                    reply = (
-                        RESPONSE_PREFIX
-                        + token.encode("ascii")
-                        + b"\0"
-                        + session_id.encode("ascii")
-                        + b"\0"
-                        + session_cipher.encode("ascii")
-                        + b"\0cc="
-                        + negotiated_cc.encode("ascii")
-                        + b"\0ct="
-                        + negotiated_cleartext.encode("ascii")
-                        + b"\0"
-                        + client_pub
+                    reply = encode_ascii_record(
+                        RESPONSE_PREFIX,
+                        token=token,
+                        session=session_id,
+                        cipher=session_cipher,
+                        cc=negotiated_cc,
+                        ct=negotiated_cleartext,
+                        pub=b64u(client_pub),
                     )
                     usock_candidate.send_plain(mkp(TYPE_HELLO, payload=reply).to_bytes(), addr)
                     challenge_reply_sent = True
                     continue
                 if pkt.payload.startswith(SESSION_PREFIX):
-                    rest = pkt.payload[len(SESSION_PREFIX):]
-                    parts = rest.split(b"\0", 4)
-                    if len(parts) != 5 or len(parts[4]) != 32:
+                    fields = parse_ascii_record(pkt.payload, SESSION_PREFIX)
+                    if not fields:
                         continue
-                    session_cipher, negotiated_cc, negotiated_cleartext = parse_hello_options(parts[1] + b"\0" + parts[2] + b"\0" + parts[3])
-                    session_cipher = session_cipher or selected_cipher
-                    server_pub = parts[4]
+                    session_cipher = normalize_cipher_name(fields.get("cipher", selected_cipher))
+                    try:
+                        server_pub = b64u_decode(fields["pub"])
+                    except Exception:
+                        continue
                     if session_cipher != selected_cipher:
                         raise SystemExit(f"server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
-                    if negotiated_cc != args.congestion_control:
-                        raise SystemExit(
-                            f"server negotiated unexpected congestion control mode {negotiated_cc}; expected {args.congestion_control}"
-                        )
-                    if negotiated_cleartext != args.cleartext:
-                        raise SystemExit(
-                            f"server negotiated unexpected cleartext mode {negotiated_cleartext}; expected {args.cleartext}"
-                        )
                     check_tofu(args.tofu_file, tofu_label, server_pub)
                     server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
                     session_key = derive_session_key(client_private.exchange(server_public), client_pub, server_pub)
-                    usock_candidate.set_peer_psk(
-                        addr,
-                        session_key,
-                        session_cipher,
-                        cleartext=(negotiated_cleartext == "on"),
-                    )
+                    usock_candidate.set_peer_psk(addr, session_key, session_cipher, cleartext=False)
                     sender_candidate = USTPSender(
                         sock=usock_candidate,
                         peer=addr,
                         window=256,
-                        rto=0.25,
+                        rto=0.20,
                         max_burst=256,
                         pump_interval=0.001,
-                        congestion_control=(negotiated_cc == "on"),
+                        congestion_control=False,
                     )
                     sender_candidate.start()
                     receiver_candidate = USTPReceiver(sock=usock_candidate, peer=addr)
-                    print(f"[UPING][{label}] connected via {family_name(family)} local={raw_candidate.getsockname()} peer={addr[0]}:{addr[1]} protocol=USTP/1.1")
-                    return TransportHandle(
-                        raw_sock=raw_candidate,
-                        usock=usock_candidate,
-                        peer=addr,
-                        sender=sender_candidate,
-                        receiver=receiver_candidate,
-                        family=family,
-                        label=label,
-                    )
+                    print(f"[UPING] connected via {family_name(family)} local={raw_candidate.getsockname()} peer={addr[0]}:{addr[1]}")
+                    return raw_candidate, usock_candidate, addr, sender_candidate, receiver_candidate
             raise TimeoutError(f"{family_name(family)} handshake timed out")
         except Exception as exc:
             last_error = exc
-            print(f"[UPING][{label}] {family_name(family)} failed: {exc}")
+            print(f"[UPING] {family_name(family)} failed: {exc}")
             if raw_candidate is not None:
                 try:
                     raw_candidate.close()
@@ -323,17 +273,22 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
     raise SystemExit("UPing connection failed")
 
 
-def close_transport(handle: TransportHandle) -> None:
+def close_transport(raw_sock, usock_obj, current_peer, current_sender) -> None:
     try:
-        if handle.usock is not None and handle.peer is not None:
-            handle.usock.send_plain(mkp(TYPE_CLOSE, payload=b"BYE").to_bytes(), handle.peer)
+        if current_sender is not None:
+            current_sender.queue_payload(encode_frame(TYPE_PING, 0, 0, time.monotonic_ns(), b"bye"))
     except Exception:
         pass
     try:
-        if handle.sender is not None:
-            handle.sender.stop()
-        if handle.raw_sock is not None:
-            handle.raw_sock.close()
+        if usock_obj is not None and current_peer is not None:
+            usock_obj.send_plain(mkp(TYPE_CLOSE, payload=b"BYE").to_bytes(), current_peer)
+    except Exception:
+        pass
+    try:
+        if current_sender is not None:
+            current_sender.stop()
+        if raw_sock is not None:
+            raw_sock.close()
     except Exception:
         pass
 
@@ -350,18 +305,6 @@ def main() -> None:
     ap.add_argument("--connect-timeout", type=float, default=6.0, help="USTPS handshake timeout per family")
     ap.add_argument("--size", "-s", type=int, default=56, help="Ping payload size")
     ap.add_argument("--cipher", default="chacha20", help="chacha20 | aes-256-gcm | aes-128-gcm")
-    ap.add_argument(
-        "--congestion-control",
-        choices=("on", "off"),
-        default="off",
-        help="Request USTPS congestion control on or off",
-    )
-    ap.add_argument(
-        "--cleartext",
-        choices=("on", "off"),
-        default="off",
-        help="Request USTPS cleartext + HMAC mode for DATA",
-    )
     ap.add_argument("--tofu-file", default=os.path.expanduser("~/.uping_known_hosts.json"))
     ap.add_argument("-4", dest="force_ipv4", action="store_true", help="Force IPv4")
     ap.add_argument("-6", dest="force_ipv6", action="store_true", help="Force IPv6")
@@ -381,124 +324,78 @@ def main() -> None:
     client_private = x25519.X25519PrivateKey.generate()
     client_pub = public_bytes(client_private.public_key())
 
-    modes = [("ustp1.1",)]
+    raw_sock, usock_obj, current_peer, current_sender, current_receiver = connect_transport(
+        args,
+        selected_cipher,
+        client_private,
+        client_pub,
+        tofu_label,
+        force_family,
+    )
 
-    transports: list[TransportHandle] = []
-    stats: dict[str, dict[str, object]] = {}
+    sent = 0
+    received = 0
+    rtts = []
+    seq = 0
+    payload = b"Q" * max(0, args.size)
+    remote_family = "IPv6" if ":" in current_peer[0] else "IPv4"
+
+    print(f"UPING {args.peer_ip} ({current_peer[0]}) over USTPS: {len(payload)} data bytes, port {args.peer_port}, {remote_family}")
+
     try:
-        for (label,) in modes:
-            client_private_mode = x25519.X25519PrivateKey.generate()
-            client_pub_mode = public_bytes(client_private_mode.public_key())
-            handle = connect_transport(
-                args,
-                selected_cipher,
-                client_private_mode,
-                client_pub_mode,
-                tofu_label,
-                force_family,
-                label,
-            )
-            transports.append(handle)
-            remote_family = "IPv6" if ":" in handle.peer[0] else "IPv4"
-            print(f"UPING[{label}] {args.peer_ip} ({handle.peer[0]}) over USTPS: {args.size} data bytes, port {args.peer_port}, {remote_family}")
-            stats[label] = {"sent": 0, "received": 0, "rtts": []}
-
-        seq = 0
-        payload = b"Q" * max(0, args.size)
-        try:
-            while args.count == 0 or seq < args.count:
-                seq += 1
-                for handle in transports:
-                    sent_ns = time.monotonic_ns()
-                    probe = RTT_PROBE_PREFIX + struct.pack("!Q", sent_ns)
-                    handle.usock.send_plain(mkp(TYPE_HELLO, payload=probe).to_bytes(), handle.peer)
-                    frame = encode_frame(TYPE_PING, 1, seq, sent_ns, payload)
-                    handle.sender.queue_payload(frame)
-                    stats[handle.label]["sent"] = int(stats[handle.label]["sent"]) + 1
-                    deadline = time.time() + args.timeout
-                    got_reply = False
-                    while time.time() < deadline:
-                        try:
-                            raw, _addr = handle.usock.recvfrom(65535)
-                        except socket.timeout:
-                            continue
-                        pkt = parse_packet(raw)
-                        if pkt is None:
-                            continue
-                        if pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST):
-                            handle.sender.on_control(pkt)
-                            continue
-                        if pkt.pkt_type == TYPE_HELLO and pkt.payload.startswith(RTT_PROBE_PREFIX):
-                            echoed = pkt.payload[len(RTT_PROBE_PREFIX) :]
-                            if len(echoed) == 8:
-                                probe_ns = struct.unpack("!Q", echoed)[0]
-                                sample = (time.monotonic_ns() - probe_ns) / 1_000_000_000.0
-                                if 0.0 < sample <= 3.0:
-                                    handle.receiver.observe_rtt(sample)
-                            continue
-                        if pkt.pkt_type == TYPE_CLOSE:
-                            raise SystemExit(f"server closed the UPing session ({handle.label})")
-                        if pkt.pkt_type != TYPE_DATA:
-                            continue
-                        is_duplicate = pkt.seq in handle.receiver.received_seq
-                        was_requested = pkt.seq in handle.receiver.missing_first_seen
-                        if is_duplicate:
-                            print(f"[{handle.label}] DUPLICATE seq={pkt.seq}: packet already received; discarded")
-                        else:
-                            expected_seq = handle.receiver.last_max_seq + 1 if handle.receiver.last_max_seq else pkt.seq
-                            if pkt.seq != expected_seq and not was_requested:
-                                print(
-                                    f"[{handle.label}] UNORD seq={pkt.seq} expected={expected_seq}: "
-                                    "packet received out of order; no retransmission needed for this packet"
-                                )
-                        app_payload = handle.receiver.handle_data(pkt)
-                        handle.receiver.maybe_nack()
-                        if not app_payload:
-                            continue
-                        reply = decode_frame(app_payload)
-                        if reply is None or reply["type"] != TYPE_PONG or reply["seq"] != seq:
-                            continue
-                        rtt_ms = (time.monotonic_ns() - reply["sent_ns"]) / 1_000_000.0
-                        stats[handle.label]["received"] = int(stats[handle.label]["received"]) + 1
-                        cast_rtts = stats[handle.label]["rtts"]
-                        assert isinstance(cast_rtts, list)
-                        cast_rtts.append(rtt_ms)
-                        remote_family = "IPv6" if ":" in handle.peer[0] else "IPv4"
-                        print(
-                            f"[{handle.label}] {len(reply['payload'])} bytes from {handle.peer[0]}:{handle.peer[1]}: "
-                            f"up_seq={seq} time={rtt_ms:.2f} ms family={remote_family}"
-                        )
-                        got_reply = True
-                        break
-                    if not got_reply:
-                        print(f"[{handle.label}] Request timeout for up_seq={seq}")
-                if args.count == 0 or seq < args.count:
-                    time.sleep(max(0.0, args.interval))
-        except KeyboardInterrupt:
-            pass
+        while args.count == 0 or sent < args.count:
+            seq += 1
+            sent_ns = time.monotonic_ns()
+            frame = encode_frame(TYPE_PING, 1, seq, sent_ns, payload)
+            current_sender.queue_payload(frame)
+            sent += 1
+            deadline = time.time() + args.timeout
+            got_reply = False
+            while time.time() < deadline:
+                try:
+                    raw, _addr = usock_obj.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                pkt = parse_packet(raw)
+                if pkt is None:
+                    continue
+                if pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST):
+                    current_sender.on_control(pkt)
+                    continue
+                if pkt.pkt_type == TYPE_CLOSE:
+                    raise SystemExit("server closed the UPing session")
+                if pkt.pkt_type != TYPE_DATA:
+                    continue
+                app_payload = current_receiver.handle_data(pkt)
+                current_receiver.maybe_nack()
+                if not app_payload:
+                    continue
+                reply = decode_frame(app_payload)
+                if reply is None or reply["type"] != TYPE_PONG or reply["seq"] != seq:
+                    continue
+                rtt_ms = (time.monotonic_ns() - reply["sent_ns"]) / 1_000_000.0
+                received += 1
+                rtts.append(rtt_ms)
+                print(
+                    f"{len(reply['payload'])} bytes from {current_peer[0]}:{current_peer[1]}: "
+                    f"up_seq={seq} time={rtt_ms:.2f} ms family={remote_family}"
+                )
+                got_reply = True
+                break
+            if not got_reply:
+                print(f"Request timeout for up_seq={seq}")
+            if args.count == 0 or sent < args.count:
+                time.sleep(max(0.0, args.interval))
+    except KeyboardInterrupt:
+        pass
     finally:
-        for handle in transports:
-            close_transport(handle)
+        close_transport(raw_sock, usock_obj, current_peer, current_sender)
 
-    for handle in transports:
-        label_stats = stats[handle.label]
-        sent = int(label_stats["sent"])
-        received = int(label_stats["received"])
-        rtts = label_stats["rtts"]
-        assert isinstance(rtts, list)
-        loss = ((sent - received) / sent * 100.0) if sent else 0.0
-        receiver_stats = handle.receiver.get_stats()
-        sender_stats = handle.sender.get_stats()
-        receiver_gave_up = max(sent - received, receiver_stats["abandoned_packets"])
-        print(f"\n--- {args.peer_ip} UPing statistics [{handle.label}] ---")
-        print(
-            f"{sent} packets transmitted, {received} received, {loss:.1f}% packet loss "
-            f"({receiver_gave_up} packets abandoned by receiver)"
-        )
-        recovered = receiver_stats["recovered_packets"] + int(sender_stats["recovered_packets"])
-        print(f"{recovered} transport packets lost but recovered by retransmission")
-        if rtts:
-            print(f"rtt min/avg/max = {min(rtts):.2f}/{(sum(rtts)/len(rtts)):.2f}/{max(rtts):.2f} ms")
+    loss = ((sent - received) / sent * 100.0) if sent else 0.0
+    print(f"\n--- {args.peer_ip} UPing statistics ---")
+    print(f"{sent} packets transmitted, {received} received, {loss:.1f}% packet loss")
+    if rtts:
+        print(f"rtt min/avg/max = {min(rtts):.2f}/{(sum(rtts)/len(rtts)):.2f}/{max(rtts):.2f} ms")
 
 
 if __name__ == "__main__":
