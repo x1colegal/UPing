@@ -375,7 +375,10 @@ def main() -> None:
             last_seen_ts=time.time(),
         )
         sessions[addr] = session
-        print(f"[UPING-SERVER] session ready {addr[0]}:{addr[1]} cipher={challenge.cipher}")
+        print(
+            f"[UPING-SERVER] session ready {addr[0]}:{addr[1]} "
+            f"cipher={challenge.cipher} cc={challenge.congestion_control} cleartext={challenge.cleartext}"
+        )
         return session
 
     try:

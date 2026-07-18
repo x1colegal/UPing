@@ -90,6 +90,38 @@ python3 client.py --peer-ip x1co.com.br -i 1.0 -W 3.0
 - this uses `USTPS`, not raw ICMP
 - TOFU is enabled on the client
 - default client/server cipher is `chacha20`
+- client supports `--congestion-control on|off`
+- server supports `--congestion-control auto|on|off`
+- client supports `--cleartext on|off`
+- server supports `--cleartext auto|on|off`
 - the tool measures RTT of the whole `USTPS` path, not bare UDP alone
 - the client output is intentionally ping-like, but it reports `USTPS` session information instead of ICMP fields
 - `--loss` simulates outbound packet loss on the server side for testing
+
+## Congestion control
+
+Client request:
+
+```bash
+python3 client.py --peer-ip x1co.com.br --congestion-control on
+```
+
+Server policy:
+
+```bash
+python3 server.py --start --congestion-control auto
+```
+
+## Cleartext + HMAC mode
+
+Client request:
+
+```bash
+python3 client.py --peer-ip x1co.com.br --cleartext on
+```
+
+Server policy:
+
+```bash
+python3 server.py --start --cleartext auto
+```

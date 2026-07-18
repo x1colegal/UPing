@@ -192,7 +192,15 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
                 now = time.time()
                 if not challenge_reply_sent and (now - last_hello_ts) >= 0.2:
                     usock_candidate.send_plain(
-                        mkp(TYPE_HELLO, payload=encode_transport_hello(client_pub, selected_cipher, "off", "off")).to_bytes(),
+                        mkp(
+                            TYPE_HELLO,
+                            payload=encode_transport_hello(
+                                client_pub,
+                                selected_cipher,
+                                args.congestion_control,
+                                args.cleartext,
+                            ),
+                        ).to_bytes(),
                         sockaddr,
                     )
                     last_hello_ts = now
@@ -236,16 +244,28 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
                     if not fields:
                         continue
                     session_cipher = normalize_cipher_name(fields.get("cipher", selected_cipher))
+                    negotiated_cc = fields.get("cc") or "off"
+                    negotiated_cleartext = fields.get("ct") or "off"
                     try:
                         server_pub = b64u_decode(fields["pub"])
                     except Exception:
                         continue
                     if session_cipher != selected_cipher:
                         raise SystemExit(f"server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
+                    if negotiated_cc not in ("on", "off"):
+                        raise SystemExit(f"server negotiated invalid congestion-control mode {negotiated_cc}")
+                    if negotiated_cleartext not in ("on", "off"):
+                        raise SystemExit(f"server negotiated invalid cleartext mode {negotiated_cleartext}")
+                    if args.congestion_control != negotiated_cc:
+                        raise SystemExit(
+                            f"server negotiated unexpected congestion-control mode {negotiated_cc}; expected {args.congestion_control}"
+                        )
+                    if args.cleartext != negotiated_cleartext:
+                        raise SystemExit(f"server negotiated unexpected cleartext mode {negotiated_cleartext}; expected {args.cleartext}")
                     check_tofu(args.tofu_file, tofu_label, server_pub)
                     server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
                     session_key = derive_session_key(client_private.exchange(server_public), client_pub, server_pub)
-                    usock_candidate.set_peer_psk(addr, session_key, session_cipher, cleartext=False)
+                    usock_candidate.set_peer_psk(addr, session_key, session_cipher, cleartext=(negotiated_cleartext == "on"))
                     sender_candidate = USTPSender(
                         sock=usock_candidate,
                         peer=addr,
@@ -253,11 +273,14 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
                         rto=0.20,
                         max_burst=256,
                         pump_interval=0.001,
-                        congestion_control=False,
+                        congestion_control=(negotiated_cc == "on"),
                     )
                     sender_candidate.start()
                     receiver_candidate = USTPReceiver(sock=usock_candidate, peer=addr)
-                    print(f"[UPING] connected via {family_name(family)} local={raw_candidate.getsockname()} peer={addr[0]}:{addr[1]}")
+                    print(
+                        f"[UPING] connected via {family_name(family)} local={raw_candidate.getsockname()} "
+                        f"peer={addr[0]}:{addr[1]} cipher={session_cipher} cc={negotiated_cc} cleartext={negotiated_cleartext}"
+                    )
                     return raw_candidate, usock_candidate, addr, sender_candidate, receiver_candidate
             raise TimeoutError(f"{family_name(family)} handshake timed out")
         except Exception as exc:
@@ -305,6 +328,8 @@ def main() -> None:
     ap.add_argument("--connect-timeout", type=float, default=6.0, help="USTPS handshake timeout per family")
     ap.add_argument("--size", "-s", type=int, default=56, help="Ping payload size")
     ap.add_argument("--cipher", default="chacha20", help="chacha20 | aes-256-gcm | aes-128-gcm")
+    ap.add_argument("--congestion-control", choices=["on", "off"], default="off", help="Request USTPS Congestion from the server")
+    ap.add_argument("--cleartext", choices=["on", "off"], default="off", help="Request cleartext + HMAC instead of AEAD")
     ap.add_argument("--tofu-file", default=os.path.expanduser("~/.uping_known_hosts.json"))
     ap.add_argument("-4", dest="force_ipv4", action="store_true", help="Force IPv4")
     ap.add_argument("-6", dest="force_ipv6", action="store_true", help="Force IPv6")
