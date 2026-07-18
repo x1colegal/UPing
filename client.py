@@ -21,6 +21,7 @@ from ustp import USTPReceiver, USTPSender, parse_packet
 HELLO_PREFIX = b"USTPS-KEX1 "
 CHALLENGE_PREFIX = b"USTPS-CHALLENGE1 "
 RESPONSE_PREFIX = b"USTPS-CHALLENGE-REPLY1 "
+RESUME_PREFIX = b"USTPS-RESUME1 "
 SESSION_PREFIX = b"USTPS-SESSION1 "
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 DEFAULT_PORT = 40002
@@ -153,7 +154,10 @@ def resolve_peer_candidates(host: str, port: int, force_family: int | None) -> l
         return [(family, sockaddr)]
     except ValueError:
         pass
-    infos = socket.getaddrinfo(normalized, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+    try:
+        infos = socket.getaddrinfo(normalized, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+    except socket.gaierror:
+        return []
     preferred = [socket.AF_INET6, socket.AF_INET] if force_family is None else [force_family]
     out = []
     seen = set()
@@ -176,7 +180,7 @@ def family_name(family: int) -> str:
 def connect_transport(args, selected_cipher: str, client_private, client_pub: bytes, tofu_label: str, force_family: int | None):
     candidates = resolve_peer_candidates(args.peer_ip, args.peer_port, force_family)
     if not candidates:
-        raise SystemExit("no UPing peer candidates")
+        raise SystemExit(f"no UPing peer candidates for {args.peer_ip}:{args.peer_port}")
     last_error = None
     for family, sockaddr in candidates:
         print(f"[UPING] trying {family_name(family)} {sockaddr[0]}:{sockaddr[1]}")
@@ -185,7 +189,7 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
             raw_candidate = bind_udp_socket(args.bind_ip, args.bind_port, family)
             raw_candidate.settimeout(0.2)
             usock_candidate = AEADDatagramSocket(raw_candidate, cipher_name=selected_cipher)
-            deadline = time.time() + args.connect_timeout
+            deadline = time.time() + min(args.connect_timeout, 3.0)
             challenge_reply_sent = False
             last_hello_ts = 0.0
             while time.time() < deadline:
@@ -291,17 +295,14 @@ def connect_transport(args, selected_cipher: str, client_private, client_pub: by
                     raw_candidate.close()
                 except Exception:
                     pass
+        if (family, sockaddr) != candidates[-1]:
+            print(f"[UPING] fallback to next address after trying {sockaddr[0]} (timeout/no reply)")
     if last_error is not None:
         raise last_error
     raise SystemExit("UPing connection failed")
 
 
 def close_transport(raw_sock, usock_obj, current_peer, current_sender) -> None:
-    try:
-        if current_sender is not None:
-            current_sender.queue_payload(encode_frame(TYPE_PING, 0, 0, time.monotonic_ns(), b"bye"))
-    except Exception:
-        pass
     try:
         if usock_obj is not None and current_peer is not None:
             usock_obj.send_plain(mkp(TYPE_CLOSE, payload=b"BYE").to_bytes(), current_peer)
